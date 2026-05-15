@@ -23,13 +23,15 @@ class Env():
         assert self.min_state <= state <= self.max_state, 'invalid state'
         row, col = state // 4, state % 4
 
-        row += self.transition[action][0]
-        col += self.transition[action][1]
+        drow, dcol = self.transition[action]
+
+        row += drow
+        col += dcol
 
         if not (0 <= row <= 3 and 0 <= col <= 3):
             # undo
-            row -= self.transition[action][0]
-            col -= self.transition[action][1]
+            row -= drow
+            col -= dcol
 
         next_state = 4 * row + col
         reward = -1
@@ -50,10 +52,16 @@ class Agent():
             'right': 1/4, 
             'left': 1/4
         }
-        self.state_values = [0 for _ in range(16)]
+        self.state_values = [0.0] * 16
 
-    def evaluate_policy(self) -> List[float]:
-        next_state_values = [0 for _ in range(16)]
+    def evaluate_policy(
+        self,
+        inplace: bool
+    ) -> List[float]:
+        if inplace:
+            next_state_values = self.state_values
+        else:
+            next_state_values = [0.0] * 16
 
         for state in range(self.env.min_state, self.env.max_state + 1):
             next_state_value = 0.0
@@ -66,21 +74,8 @@ class Agent():
 
             next_state_values[state] = next_state_value
 
-        self.state_values = next_state_values.copy()
-
-        return self.state_values.copy()
-
-    def evaluate_policy_inplace(self) -> List[float]:
-        for state in range(self.env.min_state, self.env.max_state + 1):
-            next_state_value = 0.0
-
-            for action, prob in self.policy.items():
-                next_state, reward = self.env.step(state, action)
-                
-                # p(s',r|s,a) = 1, \gamma = 1 
-                next_state_value += prob * (reward + self.state_values[next_state])
-
-            self.state_values[state] = next_state_value
+        if not inplace:
+            self.state_values = next_state_values.copy()
 
         return self.state_values.copy()
 
@@ -95,7 +90,7 @@ def iterative_policy_evaluation(
     iteration_count = 0
 
     while True:
-        next_state_values = agent.evaluate_policy_inplace() if inplace else agent.evaluate_policy()
+        next_state_values = agent.evaluate_policy(inplace)
         max_delta = 0.0
 
         for state in range(env.min_state, env.max_state + 1):
