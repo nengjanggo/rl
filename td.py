@@ -4,7 +4,7 @@ import wandb
 from collections import defaultdict
 from gymnasium.wrappers import TimeLimit
 from tqdm import tqdm
-from typing import Literal
+from typing import Literal, Tuple
 
 
 class SarsaAgent:
@@ -133,7 +133,9 @@ def train(
     epsilon: float,
     gamma: float,
     use_double_learning: bool,
-    use_wandb: bool
+    use_wandb: bool,
+    eval_episodes: int,
+    eval_rollouts: int
 ):
     if use_wandb:
         wandb.login()
@@ -148,8 +150,7 @@ def train(
             },
         )
 
-    env = gym.make('Taxi-v4', is_rainy=False, render_mode=render_mode)
-    env.metadata['render_fps'] = 100
+    env = gym.make('Taxi-v4', is_rainy=False, render_mode=None) # None for training
     wrapped_env = TimeLimit(env, max_episode_steps=200)
 
     if method != 'q_learning' and use_double_learning:
@@ -162,9 +163,13 @@ def train(
 
     all_terminated = []
     all_truncated = []
-    for episode in tqdm(range(num_episodes), desc='episode'):
-        all_reward = []
+
+    def rollout(
+        agent,
+        env: gym.Env
+    ) -> Tuple[float, float, bool, bool]:
         obs, info = env.reset()
+        all_reward = []
         done = False
 
         while not done:
@@ -178,25 +183,55 @@ def train(
             all_reward.append(reward)
 
         avg_reward = float(np.array(all_reward).sum() / len(all_reward))
+        len_episode = len(all_reward)
+
+        return avg_reward, len_episode, terminated, truncated
+        
+    for episode in tqdm(range(num_episodes), desc='episode'):
+        avg_reward, len_episode, terminated, truncated = rollout(agent, wrapped_env)
+
         if use_wandb:
             wandb.log(
                 {
                     'avg_reward': avg_reward,
-                    'len_episode': len(all_reward)
+                    'len_episode': len_episode
                 },
                 step=episode
             )
 
         all_terminated.append(float(terminated))
         all_truncated.append(float(truncated))
-        if episode % 20 == 0:
+        if episode % eval_episodes == 0:
+            # eval target policy
+            agent.epsilon = 0.0
+
+            reward_sum = 0.0
+            len_episode_sum = 0
+            target_terminated_ratio = 0.0
+            target_truncated_ratio = 0.0
+            for eval_episode in range(eval_rollouts):
+                avg_reward, len_episode, terminated, truncated = rollout(agent, wrapped_env)
+                reward_sum += avg_reward * len_episode
+                len_episode_sum += len_episode
+                target_terminated_ratio += (float(terminated) - target_terminated_ratio) / (eval_episode + 1)
+                target_truncated_ratio += (float(truncated) - target_truncated_ratio) / (eval_episode + 1)
+            target_avg_reward = reward_sum / len_episode_sum
+            target_len_episode = len_episode_sum / eval_rollouts
+
+            agent.epsilon = epsilon
+
+            # log stat
             terminated_ratio = float(np.array(all_terminated).sum() / len(all_terminated))
             truncated_ratio = float(np.array(all_truncated).sum() / len(all_truncated))
             if use_wandb:
                 wandb.log(
                     {
                         'terminated_ratio': terminated_ratio,
-                        'truncated_ratio': truncated_ratio
+                        'truncated_ratio': truncated_ratio,
+                        'target_avg_reward': target_avg_reward,
+                        'target_len_episode': target_len_episode,
+                        'target_terminated_ratio': target_terminated_ratio,
+                        'target_truncated_ratio': target_truncated_ratio
                     },
                     step=episode
                 )
@@ -207,16 +242,27 @@ def train(
         wandb.finish()
     env.close()
 
+    if render_mode is not None:
+        env = gym.make('Taxi-v4', is_rainy=False, render_mode=render_mode)
+        env.metadata['render_fps'] = 10
+        wrapped_env = TimeLimit(env, max_episode_steps=200)
+        agent.env = wrapped_env
+        agent.epsilon = 0.0 # target policy
+        for _ in range(10):
+            rollout(agent, wrapped_env)
+
 
 if __name__ == '__main__':
-    method: Literal['sarsa', 'expected_sarsa', 'q_learning'] = 'q_learning'
-    num_episodes: int = 50000
-    render_mode: Literal['human'] | None = None
-    alpha: float = 1.0
+    method: Literal['sarsa', 'expected_sarsa', 'q_learning'] = 'expected_sarsa'
+    num_episodes: int = 1000
+    render_mode: Literal['human'] | None = 'human'
+    alpha: float = 0.1
     epsilon: float = 0.1
     gamma: float = 1.0
-    use_double_learning: bool = True
+    use_double_learning: bool = False
     use_wandb: bool = True
+    eval_episodes: int = 100 # evaluate the target policy every 'eval_episodes' episodes
+    eval_rollouts: int = 50 # run 'eval_rollouts' rollouts of the target policy per evaluation
 
     train(
         method,
@@ -226,5 +272,7 @@ if __name__ == '__main__':
         epsilon,
         gamma,
         use_double_learning,
-        use_wandb
+        use_wandb,
+        eval_episodes,
+        eval_rollouts
     )
