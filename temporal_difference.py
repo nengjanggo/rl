@@ -182,7 +182,7 @@ def train(
             obs = next_obs
             all_reward.append(reward)
 
-        avg_reward = float(np.array(all_reward).sum() / len(all_reward))
+        avg_reward = sum(all_reward) / len(all_reward)
         len_episode = len(all_reward)
 
         return avg_reward, len_episode, terminated, truncated
@@ -221,8 +221,8 @@ def train(
             agent.epsilon = epsilon
 
             # log stat
-            terminated_ratio = float(np.array(all_terminated).sum() / len(all_terminated))
-            truncated_ratio = float(np.array(all_truncated).sum() / len(all_truncated))
+            terminated_ratio = sum(all_terminated) / len(all_terminated)
+            truncated_ratio = sum(all_truncated) / len(all_truncated)
             if use_wandb:
                 wandb.log(
                     {
