@@ -27,7 +27,7 @@ class PolicyGradientAgent:
         self.device: Literal['cpu', 'cuda'] = device
 
         # Humanoid-v5 action space: Box(-0.4, 0.4, (17,), float32)
-        self.a_prevction_space_size: int = env.action_space.shape[0]
+        self.action_space_size: int = env.action_space.shape[0]
 
         # Humanoid-v5 observation space: Box(-Inf, Inf, (348,), float64)
         self.obs_space_size: int = env.observation_space.shape[0]
@@ -35,12 +35,12 @@ class PolicyGradientAgent:
         self.policy_mean = nn.Sequential(
             nn.Linear(self.obs_space_size, self.hidden_dim, device=self.device),
             nn.ELU(),
-            nn.Linear(self.hidden_dim, self.a_prevction_space_size, device=self.device)
+            nn.Linear(self.hidden_dim, self.action_space_size, device=self.device)
         )
         self.policy_std = nn.Sequential(
             nn.Linear(self.obs_space_size, self.hidden_dim, device=self.device),
             nn.ELU(),
-            nn.Linear(self.hidden_dim, self.a_prevction_space_size, device=self.device),
+            nn.Linear(self.hidden_dim, self.action_space_size, device=self.device),
             nn.Softplus()
         )
 
@@ -48,7 +48,7 @@ class PolicyGradientAgent:
             self.episode_buffer: List[Tuple[np.ndarray, np.ndarray, float]] = [] # list of (obs, action, reward), cleared at the end of every episode
         elif method == 'qac': # actor-critic based on action-value critic
             self.q_network = nn.Sequential(
-                nn.Linear(self.obs_space_size + self.a_prevction_space_size, self.hidden_dim, device=self.device),
+                nn.Linear(self.obs_space_size + self.action_space_size, self.hidden_dim, device=self.device),
                 nn.ReLU(),
                 nn.Linear(self.hidden_dim, 1, device=self.device)
             )
@@ -176,18 +176,18 @@ def train(
         wandb.login()
         run_name = f'{method}_alp{alpha}_gam{gamma}'
         run = wandb.init(
-            project='rl_implementation_humanoid',
+            project='rl_implementation_InvertedPendulum-v5',
             name=run_name
         )
 
     env = gym.make(
-        'Humanoid-v5',
-        render_mode=None,
+        'InvertedPendulum-v5',
+        render_mode='None',
         width=1080,
         height=1080
     ) # None for training
     env = NormalizeObservation(env)
-    env = NormalizeReward(env)
+    # env = NormalizeReward(env)
     env = ClipAction(env)
     # env.metadata['render_fps'] = 30
     agent = PolicyGradientAgent(env, method, hidden_dim, alpha, gamma, device)
@@ -218,7 +218,7 @@ def train(
                     if isinstance(value, np.float64):
                         all_info[key] = []
 
-            reward = reward.item()
+            # reward = reward.item()
 
             if agent.method in ('qac', 'td0ac') :
                 delta = agent.update_after_step(obs, action, reward, terminated, next_obs, log_prob)
@@ -275,14 +275,14 @@ def train(
 
     if render_mode is not None:
         env = gym.make(
-            'Humanoid-v5',
+            'InvertedPendulum-v5',
             render_mode=render_mode,
             width=1080,
             height=1080
         )
         env.metadata['render_fps'] = 10
         env = NormalizeObservation(env)
-        env = NormalizeReward(env)
+        # env = NormalizeReward(env)
         env = ClipAction(env)
         agent.env = env
         for _ in range(100):
@@ -290,8 +290,8 @@ def train(
 
 
 if __name__ == '__main__':
-    method: Literal['reinforce', 'qac', 'td0ac'] = 'td0ac'
-    hidden_dim: int = 1024
+    method: Literal['reinforce', 'qac', 'td0ac'] = 'qac'
+    hidden_dim: int = 64
     num_episodes: int = 10000
     render_mode: Literal['human'] | None = 'human'
     alpha: float = 1e-4
