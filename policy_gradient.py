@@ -10,6 +10,31 @@ from tqdm import tqdm
 from typing import Dict, Literal, List, Tuple
 
 
+def get_env(
+    env_name: str,
+    render_mode: str | None,
+    normalize_observation: bool,
+    normalize_reward: bool,
+    clip_action: bool,
+    max_episode_steps: int | None = None,
+    render_fps: int | None = None
+) -> gym.Env:
+    env = gym.make(
+        env_name,
+        max_episode_steps,
+        render_mode
+    )
+    env.metadata['render_fps'] = render_fps
+    if normalize_observation:
+        env = NormalizeObservation(env)
+    if normalize_reward:
+        env = NormalizeReward(env)
+    if clip_action:
+        env = ClipAction(env)
+
+    return env
+
+
 class PolicyGradientAgent(nn.Module):
     def __init__(
         self,
@@ -181,16 +206,39 @@ class PolicyGradientAgent(nn.Module):
 
 
     def update_after_episode(
-        self,
+        self
     ) -> None:
-        raise NotImplementedError
+        if self.method != 'reinforce':
+            return
+        
+        G_t = 0.0
+        for obs, action, reward in reversed(self.episode_buffer):
+            obs_tensor = torch.Tensor(obs).to(self.device)
+            action_tensor = torch.Tensor(action).to(self.device)
+
+            G_t = reward + self.gamma * G_t
+
+            mean = self.policy_mean(obs_tensor)
+            std = self.policy_std(obs_tensor)
+            dist = Normal(mean, std)
+            log_prob = dist.log_prob(action_tensor).sum()
+
+            self.optim.zero_grad()
+
+            policy_loss = -(log_prob * G_t)
+            policy_loss.backward()
+
+            self.optim.step()
+
+        self.episode_buffer.clear()
 
 
 def train(
+    train_env: gym.Env,
+    eval_env: gym.Env,
     method: Literal['reinforce', 'qac', 'td0ac'],
     hidden_dim: int,
     num_episodes: int,
-    render_mode: Literal['human'] | None,
     alpha: float,
     gamma: float,
     use_wandb: bool,
@@ -205,16 +253,7 @@ def train(
             name=run_name
         )
 
-    env = gym.make(
-        'InvertedPendulum-v5',
-        render_mode='None',
-        width=1080,
-        height=1080
-    ) # None for training
-    # env = NormalizeObservation(env)
-    # env = NormalizeReward(env)
-    env = ClipAction(env)
-    # env.metadata['render_fps'] = 30
+    env = train_env
     agent = PolicyGradientAgent(env, method, hidden_dim, alpha, gamma, device)
 
     all_terminated = []
@@ -245,10 +284,10 @@ def train(
 
             # reward = reward.item()
 
-            if agent.method in ('qac', 'td0ac') :
-                delta = agent.update_after_step(obs, action, reward, terminated, truncated, next_obs)
+            if agent.method == 'reinforce':
+                agent.update_after_step(obs, action, reward, terminated, truncated, next_obs)
             else:
-                raise NotImplementedError
+                delta = agent.update_after_step(obs, action, reward, terminated, truncated, next_obs)
             
             all_info['reward'].append(reward)
             if (agent.method in ('qac', 'td0ac')) and (delta is not None):
@@ -260,7 +299,7 @@ def train(
             done = terminated or truncated
             obs = next_obs
 
-        # agent.update_after_episode()
+        agent.update_after_episode()
 
         for key, value in all_info.items():
             episode_stat['len_episode'] = len(value)
@@ -296,26 +335,18 @@ def train(
 
     if use_wandb:
         wandb.finish()
+
     env.close()
 
-    if render_mode is not None:
-        env = gym.make(
-            'InvertedPendulum-v5',
-            render_mode=render_mode,
-            width=1080,
-            height=1080
-        )
-        env.metadata['render_fps'] = 1
-        # env = NormalizeObservation(env)
-        # env = NormalizeReward(env)
-        env = ClipAction(env)
+    if eval_env is not None:
+        env = eval_env
         agent.env = env
         for _ in range(100):
             rollout(agent, env)
 
 
 if __name__ == '__main__':
-    method: Literal['reinforce', 'qac', 'td0ac'] = 'td0ac'
+    method: Literal['reinforce', 'qac', 'td0ac'] = 'reinforce'
     hidden_dim: int = 32
     num_episodes: int = 10000
     render_mode: Literal['human'] | None = 'human'
@@ -325,11 +356,43 @@ if __name__ == '__main__':
     eval_episodes: int = 100 # evaluate the target policy every 'eval_episodes' episodes
     device: Literal['cpu', 'cuda'] = 'cuda'
 
+    env_name: Literal[
+        'Ant-v5',
+        'Humanoid-v5',
+        'HumanoidStandup-v5',
+        'InvertedPendulum-v5',
+        'Pusher-v5'
+    ] = 'InvertedPendulum-v5'
+    normalize_observation: bool = False
+    normalize_reward: bool = False
+    clip_action: bool = True
+    max_episode_steps: int = 5000
+
+    train_env = get_env(
+        env_name=env_name,
+        render_mode=None,
+        normalize_observation=normalize_observation,
+        normalize_reward=normalize_reward,
+        clip_action=clip_action,
+        max_episode_steps=max_episode_steps
+    )
+
+    eval_env = get_env(
+        env_name=env_name,
+        render_mode=None,
+        normalize_observation=normalize_observation,
+        normalize_reward=normalize_reward,
+        clip_action=clip_action,
+        max_episode_steps=max_episode_steps,
+        render_fps=10
+    )
+
     train(
+        train_env,
+        eval_env,
         method,
         hidden_dim,
         num_episodes,
-        render_mode,
         alpha,
         gamma,
         use_wandb,
