@@ -35,6 +35,42 @@ def get_env(
     return env
 
 
+def compute_grad_mean(
+    module: nn.Module
+) -> float:
+    l1_norm_sum = 0.0
+    num_elements_sum = 0
+    for param in module.parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        l1_norm = grad.abs().sum().item()
+        num_elements = grad.numel()
+        l1_norm_sum += l1_norm
+        num_elements_sum += num_elements
+    if num_elements_sum == 0:
+        return 0.0
+    else:
+        return l1_norm_sum / num_elements_sum
+
+
+def clip_gradient(
+    module: nn.Module,
+    clip_threshold: float
+) -> float:
+    all_clip_ratio = []
+    for param in module.parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        clip_mask = grad.abs() > clip_threshold
+        clip_ratio = clip_mask.float().mean().item()
+        all_clip_ratio.append(clip_ratio)
+        grad = torch.clamp(grad, -clip_threshold, clip_threshold)
+
+    return sum(all_clip_ratio) / len(all_clip_ratio)
+    
+
 class PolicyGradientAgent(nn.Module):
     def __init__(
         self,
@@ -43,7 +79,9 @@ class PolicyGradientAgent(nn.Module):
         hidden_dim: int,
         alpha: float,
         gamma: float,
-        device: Literal['cpu', 'cuda']
+        device: Literal['cpu', 'cuda'],
+        use_wandb: bool,
+        clip_threshold: float | None
     ):
         super().__init__()
 
@@ -53,11 +91,11 @@ class PolicyGradientAgent(nn.Module):
         self.alpha: float = alpha
         self.gamma: float = gamma
         self.device: Literal['cpu', 'cuda'] = device
+        self.use_wandb: bool = use_wandb
+        self.clip_threshold: float | None = clip_threshold
+        self.episode: int = 0
 
-        # Humanoid-v5 action space: Box(-0.4, 0.4, (17,), float32)
         self.action_space_size: int = env.action_space.shape[0]
-
-        # Humanoid-v5 observation space: Box(-Inf, Inf, (348,), float64)
         self.obs_space_size: int = env.observation_space.shape[0]
 
         self.policy_mean = nn.Sequential(
@@ -131,78 +169,75 @@ class PolicyGradientAgent(nn.Module):
         if self.method == 'reinforce':
             self.episode_buffer.append((obs, action, reward))
             return
-        elif self.method == 'qac':
-            obs_tensor = torch.Tensor(obs).to(device=self.device)
-            action_tensor = torch.Tensor(action).to(device=self.device)
-            delta = None
-            if self.s_prev is not None:
+            
+        obs_tensor = torch.Tensor(obs).to(device=self.device)
+        action_tensor = torch.Tensor(action).to(device=self.device)
+        delta = None
+
+
+        def compute_log_prob(
+            obs: torch.Tensor,
+            action: torch.Tensor
+        ) -> torch.Tensor:
+            mean, std = self.forward(obs)
+            std += 1e-3
+            dist = Normal(mean, std)
+            log_prob = dist.log_prob(action).sum()
+            return log_prob
+
+
+        if self.s_prev is not None:
+            self.optim.zero_grad()
+            log_prob_prev = compute_log_prob(self.s_prev, self.a_prev)
+
+            if self.method == 'qac':
                 Q_next_detached: torch.Tensor = self.q_network(torch.cat([obs_tensor, action_tensor])).detach() # Q(s',a')
                 if terminated:
                     Q_next_detached: torch.Tensor = torch.zeros((1,), device=self.device, requires_grad=False)
                 Q_prev: torch.Tensor = self.q_network(torch.cat([self.s_prev, self.a_prev])) # Q(s,a)
 
-                self.optim.zero_grad()
-
                 delta = self.r_prev + self.gamma * Q_next_detached - Q_prev
                 q_network_loss = delta ** 2
                 q_network_loss.backward()
 
-                mean, std = self.forward(self.s_prev)
-                std += 1e-3
-                dist = Normal(mean, std)
-                log_prob_prev = dist.log_prob(self.a_prev).sum()
-
                 Q_prev_detached = Q_prev.detach().item()
                 policy_loss = -(log_prob_prev * Q_prev_detached)
-                policy_loss.backward()
-
-                self.optim.step()
-
-            self.s_prev = obs_tensor
-            self.a_prev = action_tensor
-            self.r_prev = reward
-            if terminated or truncated:
-                self.s_prev = None
-                self.a_prev = None
-                self.r_prev = None
-            if delta is not None:
-                return delta
-        elif self.method == 'td0ac':
-            obs_tensor = torch.Tensor(obs).to(device=self.device)
-            action_tensor = torch.Tensor(action).to(device=self.device)
-            delta = None
-            if self.s_prev is not None:
-                V_next: torch.Tensor = self.v_network(obs_tensor).detach() # V(s')
+            elif self.method == 'td0ac':
+                V_next_detached: torch.Tensor = self.v_network(obs_tensor).detach() # V(s')
                 if terminated:
-                    V_next: torch.Tensor = torch.zeros((1,), device=self.device, requires_grad=False)
+                    V_next_detached: torch.Tensor = torch.zeros((1,), device=self.device, requires_grad=False)
                 V_prev: torch.Tensor = self.v_network(self.s_prev) # V(s)
 
-                self.optim.zero_grad()
-
-                delta = self.r_prev + self.gamma * V_next - V_prev
+                delta = self.r_prev + self.gamma * V_next_detached - V_prev
                 v_network_loss = delta ** 2
                 v_network_loss.backward()
 
-                mean, std = self.forward(self.s_prev)
-                std += 1e-3
-                dist = Normal(mean, std)
-                log_prob_prev = dist.log_prob(self.a_prev).sum()
-
                 delta_detached = delta.detach().item()
                 policy_loss = -(log_prob_prev * delta_detached)
-                policy_loss.backward()
 
-                self.optim.step()
+            policy_loss.backward()
 
-            self.s_prev = obs_tensor
-            self.a_prev = action_tensor
-            self.r_prev = reward
-            if terminated or truncated:
-                self.s_prev = None
-                self.a_prev = None
-                self.r_prev = None
-            if delta is not None:
-                return delta
+            if self.use_wandb:
+                policy_grad_mean = (compute_grad_mean(self.policy_mean) + compute_grad_mean(self.policy_std)) / 2
+                wandb.log({'policy_grad_mean': policy_grad_mean}, step=self.episode)
+                if self.method == 'qac':
+                    q_network_grad_mean = compute_grad_mean(self.q_network)
+                    wandb.log({'q_network_grad_mean': q_network_grad_mean}, step=self.episode)
+                elif self.method == 'td0ac':
+                    v_network_grad_mean = compute_grad_mean(self.v_network)
+                    wandb.log({'v_network_grad_mean': v_network_grad_mean}, step=self.episode)
+
+            self.optim.step()
+
+        self.s_prev = obs_tensor
+        self.a_prev = action_tensor
+        self.r_prev = reward
+        if terminated or truncated:
+            self.s_prev = None
+            self.a_prev = None
+            self.r_prev = None
+        if delta is not None:
+            return delta
 
 
     def update_after_episode(
@@ -211,8 +246,15 @@ class PolicyGradientAgent(nn.Module):
         if self.method != 'reinforce':
             return
         
+        if self.use_wandb:
+            all_policy_grad_mean = []
+        if self.clip_threshold is not None:
+            all_policy_grad_clip_ratio = []
+
         G_t = 0.0
         for obs, action, reward in reversed(self.episode_buffer):
+            self.optim.zero_grad()
+
             obs_tensor = torch.Tensor(obs).to(self.device)
             action_tensor = torch.Tensor(action).to(self.device)
 
@@ -223,14 +265,23 @@ class PolicyGradientAgent(nn.Module):
             dist = Normal(mean, std)
             log_prob = dist.log_prob(action_tensor).sum()
 
-            self.optim.zero_grad()
-
             policy_loss = -(log_prob * G_t)
             policy_loss.backward()
+            
+            if self.use_wandb:
+                policy_grad_mean = (compute_grad_mean(self.policy_mean) + compute_grad_mean(self.policy_std)) / 2
+                all_policy_grad_mean.append(policy_grad_mean)
+            if self.clip_threshold is not None:
+                policy_grad_clip_ratio = (clip_gradient(self.policy_mean, self.clip_threshold) 
+                                          + clip_gradient(self.policy_std, self.clip_threshold)) / 2
+                all_policy_grad_clip_ratio.append(policy_grad_clip_ratio)
 
             self.optim.step()
 
         self.episode_buffer.clear()
+
+        wandb.log({'policy_grad_mean': sum(all_policy_grad_mean) / len(all_policy_grad_mean)}, step=self.episode)
+        wandb.log({'policy_grad_clip_ratio': sum(all_policy_grad_clip_ratio) / len(all_policy_grad_clip_ratio)}, step=self.episode)
 
 
 def train(
@@ -244,7 +295,8 @@ def train(
     gamma: float,
     use_wandb: bool,
     eval_episodes: int,
-    device: Literal['cpu', 'cuda']
+    device: Literal['cpu', 'cuda'],
+    clip_threshold: float | None
 ):
     if use_wandb:
         wandb.login()
@@ -255,7 +307,7 @@ def train(
         )
 
     env = train_env
-    agent = PolicyGradientAgent(env, method, hidden_dim, alpha, gamma, device)
+    agent = PolicyGradientAgent(env, method, hidden_dim, alpha, gamma, device, use_wandb, clip_threshold)
 
     all_terminated = []
     all_truncated = []
@@ -310,11 +362,11 @@ def train(
             if key == 'reward':
                 episode_stat['reward_total'] = sum(value)
 
-
         return episode_stat, terminated, truncated
         
 
     for episode in tqdm(range(num_episodes), desc='episode'):
+        agent.episode = episode
         episode_stat, terminated, truncated = rollout(agent, env)
 
         if use_wandb:
@@ -351,14 +403,15 @@ def train(
 
 if __name__ == '__main__':
     method: Literal['reinforce', 'qac', 'td0ac'] = 'reinforce'
-    hidden_dim: int = 256
+    hidden_dim: int = 32
     num_episodes: int = 10000
     render_mode: Literal['human'] | None = 'human'
-    alpha: float = 1e-5
+    alpha: float = 1e-3
     gamma: float = 1.0
     use_wandb: bool = True
     eval_episodes: int = 100 # evaluate the target policy every 'eval_episodes' episodes
     device: Literal['cpu', 'cuda'] = 'cuda'
+    clip_threshold: float | None = 200
 
     env_name: Literal[
         'Ant-v5', # 1e-5
@@ -366,7 +419,7 @@ if __name__ == '__main__':
         'HumanoidStandup-v5',
         'InvertedPendulum-v5', # 1e-3
         'Pusher-v5'
-    ] = 'Ant-v5'
+    ] = 'InvertedPendulum-v5'
     normalize_observation: bool = False
     normalize_reward: bool = False
     clip_action: bool = True
@@ -402,5 +455,6 @@ if __name__ == '__main__':
         gamma,
         use_wandb,
         eval_episodes,
-        device
+        device,
+        clip_threshold
     )
