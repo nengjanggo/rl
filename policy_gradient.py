@@ -234,6 +234,7 @@ class PolicyGradientAgent(nn.Module):
 
 
 def train(
+    env_name: str,
     train_env: gym.Env,
     eval_env: gym.Env,
     method: Literal['reinforce', 'qac', 'td0ac'],
@@ -249,7 +250,7 @@ def train(
         wandb.login()
         run_name = f'{method}_alp{alpha}_gam{gamma}'
         run = wandb.init(
-            project='rl_implementation_InvertedPendulum-v5',
+            project=f'rl_implementation_{env_name}',
             name=run_name
         )
 
@@ -306,6 +307,9 @@ def train(
             episode_stat[key] = sum(value) / len(value)
             if ('reward' not in key) and ('delta' not in key):
                 episode_stat['max_' + key] = max(value)
+            if key == 'reward':
+                episode_stat['reward_total'] = sum(value)
+
 
         return episode_stat, terminated, truncated
         
@@ -347,26 +351,26 @@ def train(
 
 if __name__ == '__main__':
     method: Literal['reinforce', 'qac', 'td0ac'] = 'reinforce'
-    hidden_dim: int = 32
+    hidden_dim: int = 256
     num_episodes: int = 10000
     render_mode: Literal['human'] | None = 'human'
-    alpha: float = 1e-3
+    alpha: float = 1e-5
     gamma: float = 1.0
     use_wandb: bool = True
     eval_episodes: int = 100 # evaluate the target policy every 'eval_episodes' episodes
     device: Literal['cpu', 'cuda'] = 'cuda'
 
     env_name: Literal[
-        'Ant-v5',
+        'Ant-v5', # 1e-5
         'Humanoid-v5',
         'HumanoidStandup-v5',
-        'InvertedPendulum-v5',
+        'InvertedPendulum-v5', # 1e-3
         'Pusher-v5'
-    ] = 'InvertedPendulum-v5'
+    ] = 'Ant-v5'
     normalize_observation: bool = False
     normalize_reward: bool = False
     clip_action: bool = True
-    max_episode_steps: int = 5000
+    max_episode_steps: int = 10000
 
     train_env = get_env(
         env_name=env_name,
@@ -388,6 +392,7 @@ if __name__ == '__main__':
     )
 
     train(
+        env_name,
         train_env,
         eval_env,
         method,
