@@ -72,6 +72,7 @@ class PolicyGradientAgent(nn.Module):
             nn.Softplus()
         )
 
+        self.critic = None
         if method == 'reinforce':
             self.episode_buffer: List[Tuple[np.ndarray, np.ndarray, float]] = [] # list of (obs, action, reward), cleared at the end of every episode
         elif method == 'qac': # actor-critic based on action-value critic
@@ -80,6 +81,7 @@ class PolicyGradientAgent(nn.Module):
                 nn.ELU(),
                 nn.Linear(self.hidden_dim, 1, device=self.device)
             )
+            self.critic = self.q_network
             self.s_prev = None
             self.a_prev = None
             self.r_prev = None
@@ -89,13 +91,19 @@ class PolicyGradientAgent(nn.Module):
                 nn.ELU(),
                 nn.Linear(self.hidden_dim, 1, device=self.device)
             )
+            self.critic = self.v_network
             self.s_prev = None
             self.r_prev = None
 
-        self.optim: torch.optim.Optimizer = AdamW(
-            self.parameters(),
-            self.alpha
+        self.actor_optim: torch.optim.Optimizer = AdamW(
+            list(self.policy_mean.parameters()) + list(self.policy_std.parameters()),
+            self.alpha * 0.1
         )
+        if self.critic:
+            self.critic_optim: torch.optim.Optimizer = AdamW(
+                self.critic.parameters(),
+                self.alpha
+            )
 
 
     def forward(
@@ -119,6 +127,18 @@ class PolicyGradientAgent(nn.Module):
         return action.cpu().numpy()
 
 
+    def compute_log_prob(
+        self,
+        obs: torch.Tensor,
+        action: torch.Tensor
+    ) -> torch.Tensor:
+        mean, std = self.forward(obs)
+        std += 1e-3
+        dist = Normal(mean, std)
+        log_prob = dist.log_prob(action).sum()
+        return log_prob
+    
+
     def update_after_step(
         self,
         obs: np.ndarray,
@@ -136,57 +156,62 @@ class PolicyGradientAgent(nn.Module):
         action_tensor = torch.Tensor(action).to(device=self.device)
         delta = None
 
-
-        def compute_log_prob(
-            obs: torch.Tensor,
-            action: torch.Tensor
-        ) -> torch.Tensor:
-            mean, std = self.forward(obs)
-            std += 1e-3
-            dist = Normal(mean, std)
-            log_prob = dist.log_prob(action).sum()
-            return log_prob
-
-
-        if self.s_prev is not None:
-            self.optim.zero_grad()
-            log_prob_prev = compute_log_prob(self.s_prev, self.a_prev)
-
-            if self.method == 'qac':
-                Q_next_detached: torch.Tensor = self.q_network(torch.cat([obs_tensor, action_tensor])).detach() # Q(s',a')
-                if terminated:
-                    Q_next_detached: torch.Tensor = torch.zeros((1,), device=self.device, requires_grad=False)
-                Q_prev: torch.Tensor = self.q_network(torch.cat([self.s_prev, self.a_prev])) # Q(s,a)
-
-                delta = self.r_prev + self.gamma * Q_next_detached - Q_prev
-                q_network_loss = delta ** 2
-                q_network_loss.backward()
-
-                Q_prev_detached = Q_prev.detach().item()
-                policy_loss = -(log_prob_prev * Q_prev_detached)
-            elif self.method == 'td0ac':
-                V_next_detached: torch.Tensor = self.v_network(obs_tensor).detach() # V(s')
-                if terminated:
-                    V_next_detached: torch.Tensor = torch.zeros((1,), device=self.device, requires_grad=False)
-                V_prev: torch.Tensor = self.v_network(self.s_prev) # V(s)
-
-                delta = self.r_prev + self.gamma * V_next_detached - V_prev
-                v_network_loss = delta ** 2
-                v_network_loss.backward()
-
-                delta_detached = delta.detach().item()
-                policy_loss = -(log_prob_prev * delta_detached)
-
+        def update_critic(
+            value_next: torch.Tensor, # Q(s',a') if method == 'qac', V(s') if method == 'td0ac'
+            value_prev: torch.Tensor, # Q(s,a) if method == 'qac', V(s) if method == 'td0ac'
+        ) -> None:
+            self.critic_optim.zero_grad()
+            delta = self.r_prev + self.gamma * value_next.detach() - value_prev
+            value_network_loss = delta ** 2
+            value_network_loss.backward()
+            self.critic_optim.step()
+        
+        def update_actor(
+            log_prob_prev: torch.Tensor,
+            multiplier: torch.Tensor, # Q(s,a) if method == 'qac', delta(=TD(0)) if method == 'td0ac'
+        ) -> None:
+            self.actor_optim.zero_grad()
+            policy_loss = -(log_prob_prev * multiplier.detach().item())
             policy_loss.backward()
-            self.optim.step()
+            self.actor_optim.step()
+        
+        if self.s_prev is not None:
+            log_prob_prev = self.compute_log_prob(self.s_prev, self.a_prev)
+            if self.method == 'qac':
+                Q_next: torch.Tensor = self.q_network(torch.cat([obs_tensor, action_tensor])) # Q(s',a')
+                Q_prev: torch.Tensor = self.q_network(torch.cat([self.s_prev, self.a_prev])) # Q(s,a)
+                update_critic(Q_next, Q_prev)
+                update_actor(log_prob_prev, Q_prev)
+            elif self.method == 'td0ac':
+                V_next: torch.Tensor = self.v_network(obs_tensor) # V(s')
+                V_prev: torch.Tensor = self.v_network(self.s_prev) # V(s)
+                delta = self.r_prev + self.gamma * V_next.detach() - V_prev
+                update_critic(V_next, V_prev)
+                update_actor(log_prob_prev, delta)
 
         self.s_prev = obs_tensor
         self.a_prev = action_tensor
         self.r_prev = reward
+
+        if terminated:
+            log_prob_prev = self.compute_log_prob(self.s_prev, self.a_prev)
+            if self.method == 'qac':
+                Q_next: torch.Tensor = torch.zeros((1,), device=self.device, requires_grad=False)
+                Q_prev: torch.Tensor = self.q_network(torch.cat([self.s_prev, self.a_prev])) # Q(s,a)
+                update_critic(Q_next, Q_prev)
+                update_actor(log_prob_prev, Q_prev)
+            elif self.method == 'td0ac':
+                V_next: torch.Tensor = torch.zeros((1,), device=self.device, requires_grad=False)
+                V_prev: torch.Tensor = self.v_network(self.s_prev) # V(s)
+                delta = self.r_prev + self.gamma * V_next.detach() - V_prev
+                update_critic(V_next, V_prev)
+                update_actor(log_prob_prev, delta)
+
         if terminated or truncated:
             self.s_prev = None
             self.a_prev = None
             self.r_prev = None
+
         if delta is not None:
             return delta
 
@@ -198,24 +223,19 @@ class PolicyGradientAgent(nn.Module):
             return
         
         G_t = 0.0
-        self.optim.zero_grad()
 
+        self.actor_optim.zero_grad()
         for obs, action, reward in reversed(self.episode_buffer):
-
             obs_tensor = torch.Tensor(obs).to(self.device)
             action_tensor = torch.Tensor(action).to(self.device)
 
             G_t = reward + self.gamma * G_t
 
-            mean = self.policy_mean(obs_tensor)
-            std = self.policy_std(obs_tensor)
-            dist = Normal(mean, std)
-            log_prob = dist.log_prob(action_tensor).sum()
-
+            log_prob = self.compute_log_prob(obs_tensor, action_tensor)
             policy_loss = -(log_prob * G_t)
             policy_loss.backward()
 
-        self.optim.step()
+        self.actor_optim.step()
         self.episode_buffer.clear()
 
 
@@ -289,8 +309,9 @@ def train(
         agent.update_after_episode()
 
         for key, value in all_info.items():
-            episode_stat['len_episode'] = len(value)
-            episode_stat[key] = sum(value) / len(value)
+            if value:
+                episode_stat['len_episode'] = len(value)
+                episode_stat[key] = sum(value) / len(value)
             if ('reward' not in key) and ('delta' not in key):
                 episode_stat['max_' + key] = max(value)
             if key == 'reward':
@@ -336,7 +357,7 @@ def train(
 
 
 if __name__ == '__main__':
-    method: Literal['reinforce', 'qac', 'td0ac'] = 'reinforce'
+    method: Literal['reinforce', 'qac', 'td0ac'] = 'qac'
     hidden_dim: int = 32
     num_episodes: int = 10000
     render_mode: Literal['human'] | None = 'human'
