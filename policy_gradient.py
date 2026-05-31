@@ -33,42 +33,6 @@ def get_env(
         env = ClipAction(env)
 
     return env
-
-
-def compute_grad_mean(
-    module: nn.Module
-) -> float:
-    l1_norm_sum = 0.0
-    num_elements_sum = 0
-    for param in module.parameters():
-        grad = param.grad
-        if grad is None:
-            continue
-        l1_norm = grad.abs().sum().item()
-        num_elements = grad.numel()
-        l1_norm_sum += l1_norm
-        num_elements_sum += num_elements
-    if num_elements_sum == 0:
-        return 0.0
-    else:
-        return l1_norm_sum / num_elements_sum
-
-
-def clip_gradient(
-    module: nn.Module,
-    clip_threshold: float
-) -> float:
-    all_clip_ratio = []
-    for param in module.parameters():
-        grad = param.grad
-        if grad is None:
-            continue
-        clip_mask = grad.abs() > clip_threshold
-        clip_ratio = clip_mask.float().mean().item()
-        all_clip_ratio.append(clip_ratio)
-        grad = torch.clamp(grad, -clip_threshold, clip_threshold)
-
-    return sum(all_clip_ratio) / len(all_clip_ratio)
     
 
 class PolicyGradientAgent(nn.Module):
@@ -80,8 +44,7 @@ class PolicyGradientAgent(nn.Module):
         alpha: float,
         gamma: float,
         device: Literal['cpu', 'cuda'],
-        use_wandb: bool,
-        clip_threshold: float | None
+        use_wandb: bool
     ):
         super().__init__()
 
@@ -92,7 +55,6 @@ class PolicyGradientAgent(nn.Module):
         self.gamma: float = gamma
         self.device: Literal['cpu', 'cuda'] = device
         self.use_wandb: bool = use_wandb
-        self.clip_threshold: float | None = clip_threshold
         self.episode: int = 0
 
         self.action_space_size: int = env.action_space.shape[0]
@@ -216,17 +178,6 @@ class PolicyGradientAgent(nn.Module):
                 policy_loss = -(log_prob_prev * delta_detached)
 
             policy_loss.backward()
-
-            if self.use_wandb:
-                policy_grad_mean = (compute_grad_mean(self.policy_mean) + compute_grad_mean(self.policy_std)) / 2
-                wandb.log({'policy_grad_mean': policy_grad_mean}, step=self.episode)
-                if self.method == 'qac':
-                    q_network_grad_mean = compute_grad_mean(self.q_network)
-                    wandb.log({'q_network_grad_mean': q_network_grad_mean}, step=self.episode)
-                elif self.method == 'td0ac':
-                    v_network_grad_mean = compute_grad_mean(self.v_network)
-                    wandb.log({'v_network_grad_mean': v_network_grad_mean}, step=self.episode)
-
             self.optim.step()
 
         self.s_prev = obs_tensor
@@ -246,14 +197,10 @@ class PolicyGradientAgent(nn.Module):
         if self.method != 'reinforce':
             return
         
-        if self.use_wandb:
-            all_policy_grad_mean = []
-        if self.clip_threshold is not None:
-            all_policy_grad_clip_ratio = []
-
         G_t = 0.0
+        self.optim.zero_grad()
+
         for obs, action, reward in reversed(self.episode_buffer):
-            self.optim.zero_grad()
 
             obs_tensor = torch.Tensor(obs).to(self.device)
             action_tensor = torch.Tensor(action).to(self.device)
@@ -267,21 +214,9 @@ class PolicyGradientAgent(nn.Module):
 
             policy_loss = -(log_prob * G_t)
             policy_loss.backward()
-            
-            if self.use_wandb:
-                policy_grad_mean = (compute_grad_mean(self.policy_mean) + compute_grad_mean(self.policy_std)) / 2
-                all_policy_grad_mean.append(policy_grad_mean)
-            if self.clip_threshold is not None:
-                policy_grad_clip_ratio = (clip_gradient(self.policy_mean, self.clip_threshold) 
-                                          + clip_gradient(self.policy_std, self.clip_threshold)) / 2
-                all_policy_grad_clip_ratio.append(policy_grad_clip_ratio)
 
-            self.optim.step()
-
+        self.optim.step()
         self.episode_buffer.clear()
-
-        wandb.log({'policy_grad_mean': sum(all_policy_grad_mean) / len(all_policy_grad_mean)}, step=self.episode)
-        wandb.log({'policy_grad_clip_ratio': sum(all_policy_grad_clip_ratio) / len(all_policy_grad_clip_ratio)}, step=self.episode)
 
 
 def train(
@@ -295,8 +230,7 @@ def train(
     gamma: float,
     use_wandb: bool,
     eval_episodes: int,
-    device: Literal['cpu', 'cuda'],
-    clip_threshold: float | None
+    device: Literal['cpu', 'cuda']
 ):
     if use_wandb:
         wandb.login()
@@ -307,7 +241,7 @@ def train(
         )
 
     env = train_env
-    agent = PolicyGradientAgent(env, method, hidden_dim, alpha, gamma, device, use_wandb, clip_threshold)
+    agent = PolicyGradientAgent(env, method, hidden_dim, alpha, gamma, device, use_wandb)
 
     all_terminated = []
     all_truncated = []
@@ -407,11 +341,10 @@ if __name__ == '__main__':
     num_episodes: int = 10000
     render_mode: Literal['human'] | None = 'human'
     alpha: float = 1e-3
-    gamma: float = 1.0
+    gamma: float = 0.99
     use_wandb: bool = True
     eval_episodes: int = 100 # evaluate the target policy every 'eval_episodes' episodes
     device: Literal['cpu', 'cuda'] = 'cuda'
-    clip_threshold: float | None = 200
 
     env_name: Literal[
         'Ant-v5', # 1e-5
@@ -455,6 +388,5 @@ if __name__ == '__main__':
         gamma,
         use_wandb,
         eval_episodes,
-        device,
-        clip_threshold
+        device
     )
