@@ -357,7 +357,7 @@ def train(
 
 
 if __name__ == '__main__':
-    method: Literal['reinforce', 'qac', 'td0ac'] = 'qac'
+    method: Literal['reinforce', 'qac', 'td0ac'] = 'td0ac'
     hidden_dim: int = 32
     num_episodes: int = 10000
     render_mode: Literal['human'] | None = 'human'
@@ -372,8 +372,9 @@ if __name__ == '__main__':
         'Humanoid-v5',
         'HumanoidStandup-v5',
         'InvertedPendulum-v5', # 1e-3
-        'Pusher-v5'
-    ] = 'InvertedPendulum-v5'
+        'Pusher-v5',
+        'Walker2d-v5'
+    ] = 'Walker2d-v5'
     normalize_observation: bool = False
     normalize_reward: bool = False
     clip_action: bool = True
@@ -390,7 +391,7 @@ if __name__ == '__main__':
 
     eval_env = get_env(
         env_name=env_name,
-        render_mode=None,
+        render_mode=render_mode,
         normalize_observation=normalize_observation,
         normalize_reward=normalize_reward,
         clip_action=clip_action,

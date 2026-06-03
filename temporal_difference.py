@@ -36,8 +36,8 @@ class SarsaAgent:
         if np.random.rand() < self.epsilon: # random
             action = np.random.choice(self.action_space_size)
         else: # greedy
-            prob = self.Q[obs]
-            action = int(np.argmax(prob))
+            q_values = self.Q[obs]
+            action = int(np.argmax(q_values))
         
         return action
     
