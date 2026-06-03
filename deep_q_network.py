@@ -103,7 +103,7 @@ class DQNAgent():
         self
     ) -> torch.Tensor:
         frames = [self.replay_buffer[-4][-2], self.replay_buffer[-3][-2], self.replay_buffer[-2][-2], self.replay_buffer[-1][-2]]
-        stacked_frames = torch.concatenate(frames, dim=1).to(self.device).to(torch.float)
+        stacked_frames = torch.concatenate(frames, dim=1).to(self.device).to(torch.float) / 255.0
         return stacked_frames
 
 
@@ -155,10 +155,10 @@ class DQNAgent():
 
                 num_collected_samples += 1
 
-        obs_stack_batch = torch.concatenate(obs_stack_batch, dim=0).to(self.device).to(torch.float)
+        obs_stack_batch = torch.concatenate(obs_stack_batch, dim=0).to(self.device).to(torch.float) / 255.0
         action_batch = torch.Tensor(action_batch).to(self.device).to(torch.int)
         reward_batch = torch.Tensor(reward_batch).to(self.device).to(torch.float)
-        next_obs_stack_batch = torch.concatenate(next_obs_stack_batch, dim=0).to(self.device).to(torch.float)
+        next_obs_stack_batch = torch.concatenate(next_obs_stack_batch, dim=0).to(self.device).to(torch.float) / 255.0
         terminated_batch = torch.Tensor(terminated_batch).to(self.device).to(torch.float)
 
         return obs_stack_batch, action_batch, reward_batch, next_obs_stack_batch, terminated_batch
