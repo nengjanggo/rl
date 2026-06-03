@@ -95,7 +95,7 @@ class DQNAgent():
         obs: np.ndarray # (210,160)
     ) -> torch.Tensor:
         obs_tensor = torch.Tensor(obs).unsqueeze(0).unsqueeze(0) # (1,1,210,160)
-        preprocessed_obs = nn.functional.interpolate(obs_tensor, (110, 84))[:,:,18:102,:] # (1,1,84,84)
+        preprocessed_obs = nn.functional.interpolate(obs_tensor, (110, 84))[:,:,18:102,:].to(torch.uint8) # (1,1,84,84)
         return preprocessed_obs
     
 
@@ -103,7 +103,7 @@ class DQNAgent():
         self
     ) -> torch.Tensor:
         frames = [self.replay_buffer[-4][-2], self.replay_buffer[-3][-2], self.replay_buffer[-2][-2], self.replay_buffer[-1][-2]]
-        stacked_frames = torch.concatenate(frames, dim=1)
+        stacked_frames = torch.concatenate(frames, dim=1).to(self.device).to(torch.float)
         return stacked_frames
 
 
@@ -155,11 +155,11 @@ class DQNAgent():
 
                 num_collected_samples += 1
 
-        obs_stack_batch = torch.concatenate(obs_stack_batch, dim=0).to(self.device)
-        action_batch = torch.Tensor(action_batch).to(torch.int).to(self.device)
-        reward_batch = torch.Tensor(reward_batch).to(self.device)
-        next_obs_stack_batch = torch.concatenate(next_obs_stack_batch, dim=0).to(self.device)
-        terminated_batch = torch.Tensor(terminated_batch).to(self.device)
+        obs_stack_batch = torch.concatenate(obs_stack_batch, dim=0).to(self.device).to(torch.float)
+        action_batch = torch.Tensor(action_batch).to(self.device).to(torch.int)
+        reward_batch = torch.Tensor(reward_batch).to(self.device).to(torch.float)
+        next_obs_stack_batch = torch.concatenate(next_obs_stack_batch, dim=0).to(self.device).to(torch.float)
+        terminated_batch = torch.Tensor(terminated_batch).to(self.device).to(torch.float)
 
         return obs_stack_batch, action_batch, reward_batch, next_obs_stack_batch, terminated_batch
     
@@ -168,9 +168,9 @@ class DQNAgent():
         self
     ) -> None:
         obs_stack_batch, action_batch, reward_batch, next_obs_stack_batch, terminated_batch = self.sample_minibatch()
-        q: torch.Tensor = self.q_network(obs_stack_batch.to(self.device))[torch.arange(self.batch_size), action_batch]
+        q: torch.Tensor = self.q_network(obs_stack_batch)[torch.arange(self.batch_size), action_batch]
         with torch.no_grad():
-            q_next: torch.Tensor = self.q_target_network(next_obs_stack_batch.to(self.device))
+            q_next: torch.Tensor = self.q_target_network(next_obs_stack_batch)
             target_batch = reward_batch + self.discount_factor * q_next.max(dim=-1).values * (1 - terminated_batch)
         loss = torch.mean((target_batch - q) ** 2)
         self.optim.zero_grad()
