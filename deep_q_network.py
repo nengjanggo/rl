@@ -25,6 +25,102 @@ def get_env(
     return env
 
 
+class ReplayBuffer():
+    def __init__(
+        self,
+        batch_size: int,
+        replay_memory_size: int,
+        device: Literal['cpu', 'cuda']
+    ):
+        self.obs_buffer = torch.zeros(
+            (replay_memory_size + 1, 1, 84, 84), dtype=torch.uint8, device='cpu'
+        )
+        self.action_buffer = torch.zeros(
+            (replay_memory_size, 1), dtype=torch.int, device='cpu'
+        )
+        self.reward_buffer = torch.zeros(
+            (replay_memory_size, 1), dtype=torch.int, device='cpu'
+        )
+        self.terminated_buffer = torch.zeros(
+            (replay_memory_size, 1), dtype=torch.int, device='cpu'
+        )
+
+        self.batch_size: int = batch_size
+        self.replay_memory_size: int = replay_memory_size
+        self.device = device
+
+        self.curr_idx: int = 0
+        self.full: int = 0
+
+
+    def increase(
+        self
+    ) -> None:
+        self.curr_idx = (self.curr_idx + 1) % self.replay_memory_size
+        if self.full < self.replay_memory_size:
+            self.full += 1
+
+    
+    def append(
+        self,
+        obs: torch.Tensor,
+        action: int,
+        reward: float,
+        next_obs: torch.Tensor,
+        terminated: bool
+    ) -> None:
+        assert obs.shape == (1, 1, 84, 84)
+        assert next_obs.shape == (1, 1, 84, 84)
+
+        if self.full == 0 or int(self.terminated_buffer[self.curr_idx - 1]) == 1:
+            # start of episode
+            self.obs_buffer[self.curr_idx] = obs
+        self.action_buffer[self.curr_idx] = action
+        self.reward_buffer[self.curr_idx] = reward
+        self.obs_buffer[(self.curr_idx + 1) % (self.replay_memory_size + 1)] = next_obs
+        self.terminated_buffer[self.curr_idx] = terminated
+        self.increase()
+    
+
+    def sample_minibatch(
+        self
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        obs_stack_batch = []
+        action_batch = []
+        reward_batch = []
+        next_obs_stack_batch = []
+        terminated_batch = []
+
+        while len(obs_stack_batch) < self.batch_size:
+            indices = torch.randint(0, self.full - 3, (self.batch_size - len(obs_stack_batch),))
+            
+            for idx in indices.tolist():
+                if torch.any(self.terminated_buffer[idx : idx + 3] == 1):
+                    continue
+                obs_stack_batch.append(self.obs_buffer[idx : idx + 4].transpose(0, 1))
+                action_batch.append(self.action_buffer[idx + 3])
+                reward_batch.append(self.reward_buffer[idx + 3])
+                next_obs_stack_batch.append(self.obs_buffer[idx + 1 : idx + 5].transpose(0, 1))
+                terminated_batch.append(self.terminated_buffer[idx + 3])
+
+        obs_stack_batch = torch.cat(obs_stack_batch).to(torch.float).to(self.device) / 255.0
+        action_batch = torch.cat(action_batch).to(torch.int).to(self.device)
+        reward_batch = torch.cat(reward_batch).to(torch.float).to(self.device)
+        next_obs_stack_batch = torch.cat(next_obs_stack_batch).to(torch.float).to(self.device) / 255.0
+        terminated_batch = torch.cat(terminated_batch).to(torch.float).to(self.device)
+
+        return obs_stack_batch, action_batch, reward_batch, next_obs_stack_batch, terminated_batch
+    
+
+    def stack_recent_frames(
+        self
+    ) -> torch.Tensor:
+        offsets = torch.arange(-2, 2)
+        indices = (self.curr_idx + offsets) % (self.replay_memory_size + 1)
+        frame_stack = self.obs_buffer[indices]
+        return frame_stack.transpose(0, 1).to(torch.float).to(self.device) / 255.0
+
+
 class DQNAgent():
     def __init__(
         self,
@@ -32,6 +128,8 @@ class DQNAgent():
         batch_size: int,
         replay_memory_size: int,
         target_network_update_frequency: int,
+        use_dueling: bool,
+        use_double: bool,
         discount_factor: float,
         lr: float,
         replay_start_size: int,
@@ -44,6 +142,8 @@ class DQNAgent():
         self.batch_size: int = batch_size
         self.replay_memory_size: int = replay_memory_size
         self.target_network_update_frequency: int = target_network_update_frequency
+        self.use_dueling: bool = use_dueling
+        self.use_double: bool = use_double
         self.discount_factor: float = discount_factor
         self.lr: float = lr
         self.replay_start_size: int = replay_start_size
@@ -54,32 +154,14 @@ class DQNAgent():
         self.obs_space_size: int = env.observation_space.shape[0] # 210
 
         # We trained for a total of 10 million frames and used a replay memory of one million most recent frames. - from dqn paper
-        self.total_frames = 10 ** 7
-        self.trained_frames = 0
-        self.trained_episodes = 0
-        self.epsilon = 1.0 # ... annealed linearly from 1 to 0.1 over the first million frames, and fixed at 0.1 thereafter. - from dqn paper
-        self.replay_buffer: Deque[Tuple[torch.Tensor, int, float, torch.Tensor, bool]] = deque(maxlen=replay_memory_size)
+        self.total_frames: int = 10 ** 7
+        self.trained_frames: int = 0
+        self.trained_episodes: int = 0
+        self.epsilon: float = 1.0 # ... annealed linearly from 1 to 0.1 over the first million frames, and fixed at 0.1 thereafter. - from dqn paper
+        self.epsilon_backup: float | None = None
 
-        self.q_network: nn.Module = nn.Sequential(
-            nn.Conv2d(4, 16, 8, 4),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, 4, 2),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(2592, 256),
-            nn.ReLU(),
-            nn.Linear(256, self.action_space_size)
-        )
-        self.q_target_network: nn.Module = nn.Sequential(
-            nn.Conv2d(4, 16, 8, 4),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, 4, 2),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(2592, 256),
-            nn.ReLU(),
-            nn.Linear(256, self.action_space_size)
-        )
+        self.q_network: nn.Module = self.get_q_network(use_dueling)
+        self.q_target_network: nn.Module = self.get_q_network(use_dueling)
         self.q_network.to(device)
         self.q_target_network.to(device)
         self.update_target_network()
@@ -89,6 +171,43 @@ class DQNAgent():
             self.lr
         )
 
+        self.replay_buffer: ReplayBuffer = ReplayBuffer(batch_size, replay_memory_size, device)
+
+
+    def train_mode(
+        self
+    ) -> None:
+        assert self.epsilon == 0.0
+        self.epsilon = self.epsilon_backup
+        self.epsilon_backup = None
+
+
+    def eval_mode(
+        self
+    ) -> None:
+        assert self.epsilon_backup is None
+        self.epsilon_backup = self.epsilon
+        self.epsilon = 0.0
+
+
+    def get_q_network(
+        self,
+        use_dueling: bool = False
+    ) -> nn.Module:
+        if not use_dueling:
+            return nn.Sequential(
+                nn.Conv2d(4, 16, 8, 4),
+                nn.ReLU(),
+                nn.Conv2d(16, 32, 4, 2),
+                nn.ReLU(),
+                nn.Flatten(),
+                nn.Linear(2592, 256),
+                nn.ReLU(),
+                nn.Linear(256, self.action_space_size)
+            )
+        else:
+            raise NotImplementedError
+
     
     def preprocess_obs(
         self,
@@ -97,14 +216,6 @@ class DQNAgent():
         obs_tensor = torch.Tensor(obs).unsqueeze(0).unsqueeze(0) # (1,1,210,160)
         preprocessed_obs = nn.functional.interpolate(obs_tensor, (110, 84))[:,:,18:102,:].to(torch.uint8) # (1,1,84,84)
         return preprocessed_obs
-    
-
-    def stack_frames(
-        self
-    ) -> torch.Tensor:
-        frames = [self.replay_buffer[-4][-2], self.replay_buffer[-3][-2], self.replay_buffer[-2][-2], self.replay_buffer[-1][-2]]
-        stacked_frames = torch.concatenate(frames, dim=1).to(self.device).to(torch.float) / 255.0
-        return stacked_frames
 
 
     def get_action(
@@ -119,55 +230,10 @@ class DQNAgent():
         return action
     
 
-    def sample_minibatch(
-        self
-    ) -> Tuple[
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor,
-            torch.Tensor
-        ]:
-        obs_stack_batch = []
-        action_batch = []
-        reward_batch = []
-        next_obs_stack_batch = []
-        terminated_batch = []
-
-        num_collected_samples = 0
-        while num_collected_samples < self.batch_size:
-            indices = random.sample(range(len(self.replay_buffer) - 3), self.batch_size - num_collected_samples)
-            for idx in indices:
-                slice = list(islice(self.replay_buffer, idx, idx + 4))
-                if True in [tuple[-1] for tuple in slice[:-1]]: # tuple[-1]: terminated
-                    continue
-                obs_stack = torch.concatenate([tuple[0] for tuple in slice], dim=1)
-                action = slice[-1][1]
-                reward = slice[-1][2]
-                next_obs_stack = torch.concatenate([tuple[-2] for tuple in slice], dim=1)
-                terminated = slice[-1][-1]
-
-                obs_stack_batch.append(obs_stack)
-                action_batch.append(action)
-                reward_batch.append(reward)
-                next_obs_stack_batch.append(next_obs_stack)
-                terminated_batch.append(float(terminated))
-
-                num_collected_samples += 1
-
-        obs_stack_batch = torch.concatenate(obs_stack_batch, dim=0).to(self.device).to(torch.float) / 255.0
-        action_batch = torch.Tensor(action_batch).to(self.device).to(torch.int)
-        reward_batch = torch.Tensor(reward_batch).to(self.device).to(torch.float)
-        next_obs_stack_batch = torch.concatenate(next_obs_stack_batch, dim=0).to(self.device).to(torch.float) / 255.0
-        terminated_batch = torch.Tensor(terminated_batch).to(self.device).to(torch.float)
-
-        return obs_stack_batch, action_batch, reward_batch, next_obs_stack_batch, terminated_batch
-    
-
     def update_network(
         self
     ) -> None:
-        obs_stack_batch, action_batch, reward_batch, next_obs_stack_batch, terminated_batch = self.sample_minibatch()
+        obs_stack_batch, action_batch, reward_batch, next_obs_stack_batch, terminated_batch = self.replay_buffer.sample_minibatch()
         q: torch.Tensor = self.q_network(obs_stack_batch)[torch.arange(self.batch_size), action_batch]
         with torch.no_grad():
             q_next: torch.Tensor = self.q_target_network(next_obs_stack_batch)
@@ -203,16 +269,14 @@ class DQNAgent():
         next_obs: np.ndarray
     ) -> None:
         self.replay_buffer.append(
-            (
-                self.preprocess_obs(obs),
-                action,
-                reward,
-                self.preprocess_obs(next_obs),
-                terminated
-            )
+            self.preprocess_obs(obs),
+            action,
+            reward,
+            self.preprocess_obs(next_obs),
+            terminated
         )
 
-        if len(self.replay_buffer) >= self.replay_start_size:
+        if self.replay_buffer.full >= self.replay_start_size:
             self.update_network()
         if self.trained_frames % self.target_network_update_frequency == 0:
             self.update_target_network()
@@ -244,11 +308,9 @@ def train(
         while not done:
             if step <= 4:
                 action = 0 # noop
-            elif step % 4 == 0:
-                stacked_frames = agent.stack_frames()
-                action = agent.get_action(stacked_frames)
             else:
-                pass # repeat action
+                stacked_frames = agent.replay_buffer.stack_recent_frames()
+                action = agent.get_action(stacked_frames)
             next_obs, reward, terminated, truncated, info = agent.env.step(action)
             agent.update_after_step(obs, action, reward, terminated, truncated, next_obs)
             done = terminated or truncated
@@ -278,6 +340,7 @@ def train(
 
     if eval_env is not None:
         agent.env = eval_env
+        agent.eval_mode()
         for _ in range(100):
             rollout(agent)
 
@@ -286,8 +349,10 @@ if __name__ == '__main__':
     batch_size: int = 32
     replay_memory_size = 1000000
     target_network_update_frequency: int = 10000
+    use_dueling: bool = False
+    use_double: bool = False
     discount_factor: float = 0.99
-    lr: float = 1e-3
+    lr: float = 3e-4
     # replay_start_size: int = 50000
     replay_start_size: int = 500
 
@@ -311,6 +376,8 @@ if __name__ == '__main__':
         batch_size,
         replay_memory_size,
         target_network_update_frequency,
+        use_dueling,
+        use_double,
         discount_factor,
         lr,
         replay_start_size,
