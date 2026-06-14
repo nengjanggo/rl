@@ -1,14 +1,11 @@
 import ale_py
 import gymnasium as gym
 import numpy as np
-import random
 import torch
 import wandb
-from collections import deque
-from itertools import islice
 from torch import nn
 from torch.optim import AdamW
-from typing import Dict, Deque, Literal, Tuple
+from typing import Literal, Tuple
 
 
 def get_env(
@@ -32,18 +29,10 @@ class ReplayBuffer():
         replay_memory_size: int,
         device: Literal['cpu', 'cuda']
     ):
-        self.obs_buffer = torch.zeros(
-            (replay_memory_size + 1, 1, 84, 84), dtype=torch.uint8, device='cpu'
-        )
-        self.action_buffer = torch.zeros(
-            (replay_memory_size, 1), dtype=torch.int, device='cpu'
-        )
-        self.reward_buffer = torch.zeros(
-            (replay_memory_size, 1), dtype=torch.int, device='cpu'
-        )
-        self.terminated_buffer = torch.zeros(
-            (replay_memory_size, 1), dtype=torch.int, device='cpu'
-        )
+        self.obs_buffer = torch.zeros((replay_memory_size, 1, 84, 84), dtype=torch.uint8, device='cpu')
+        self.action_buffer = torch.zeros((replay_memory_size, 1), dtype=torch.int, device='cpu')
+        self.reward_buffer = torch.zeros((replay_memory_size, 1), dtype=torch.int, device='cpu')
+        self.terminated_buffer = torch.zeros((replay_memory_size, 1), dtype=torch.int, device='cpu')
 
         self.batch_size: int = batch_size
         self.replay_memory_size: int = replay_memory_size
@@ -72,12 +61,16 @@ class ReplayBuffer():
         assert obs.shape == (1, 1, 84, 84)
         assert next_obs.shape == (1, 1, 84, 84)
 
-        if self.full == 0 or int(self.terminated_buffer[self.curr_idx - 1]) == 1:
-            # start of episode
+        if self.full == 0:
+            self.obs_buffer[self.curr_idx] = obs
+        elif int(self.terminated_buffer[self.curr_idx - 1]) == 1:
+            # start of episode, now self.obs_buffer[self.curr_idx] is terminal state, so we increase self.curr_idx
+            self.terminated_buffer[self.curr_idx] = terminated
+            self.increase()
             self.obs_buffer[self.curr_idx] = obs
         self.action_buffer[self.curr_idx] = action
         self.reward_buffer[self.curr_idx] = reward
-        self.obs_buffer[(self.curr_idx + 1) % (self.replay_memory_size + 1)] = next_obs
+        self.obs_buffer[(self.curr_idx + 1) % self.replay_memory_size] = next_obs
         self.terminated_buffer[self.curr_idx] = terminated
         self.increase()
     
@@ -92,7 +85,7 @@ class ReplayBuffer():
         terminated_batch = []
 
         while len(obs_stack_batch) < self.batch_size:
-            indices = torch.randint(0, self.full - 3, (self.batch_size - len(obs_stack_batch),))
+            indices = torch.randint(0, self.full - 4, (self.batch_size - len(obs_stack_batch),))
             
             for idx in indices.tolist():
                 if torch.any(self.terminated_buffer[idx : idx + 3] == 1):
@@ -115,8 +108,8 @@ class ReplayBuffer():
     def stack_recent_frames(
         self
     ) -> torch.Tensor:
-        offsets = torch.arange(-2, 2)
-        indices = (self.curr_idx + offsets) % (self.replay_memory_size + 1)
+        offsets = torch.arange(-3, 1)
+        indices = (self.curr_idx + offsets) % self.replay_memory_size
         frame_stack = self.obs_buffer[indices]
         return frame_stack.transpose(0, 1).to(torch.float).to(self.device) / 255.0
 
@@ -206,7 +199,39 @@ class DQNAgent():
                 nn.Linear(256, self.action_space_size)
             )
         else:
-            raise NotImplementedError
+            class DuelingDQN(nn.Module):
+                def __init__(self, action_space_size):
+                    super().__init__()
+                    self.backbone = nn.Sequential(
+                        nn.Conv2d(4, 16, 8, 4),
+                        nn.ReLU(),
+                        nn.Conv2d(16, 32, 4, 2),
+                        nn.ReLU(),
+                        nn.Flatten()
+                    )
+                    self.value_head = nn.Sequential(
+                        nn.Linear(2592, 256),
+                        nn.ReLU(),
+                        nn.Linear(256, 1)
+                    )                
+                    self.advantage_head = nn.Sequential(
+                        nn.Linear(2592, 256),
+                        nn.ReLU(),
+                        nn.Linear(256, action_space_size)
+                    )
+
+
+                def forward(
+                    self,
+                    x: torch.Tensor
+                ):
+                    latent: torch.Tensor = self.backbone(x)
+                    value: torch.Tensor = self.value_head(latent)
+                    advantage: torch.Tensor = self.advantage_head(latent)
+                    return value + advantage - advantage.mean(dim=-1, keepdim=True)
+
+
+            return DuelingDQN(self.action_space_size)
 
     
     def preprocess_obs(
@@ -232,16 +257,21 @@ class DQNAgent():
 
     def update_network(
         self
-    ) -> None:
+    ) -> Tuple[float, float]:
         obs_stack_batch, action_batch, reward_batch, next_obs_stack_batch, terminated_batch = self.replay_buffer.sample_minibatch()
         q: torch.Tensor = self.q_network(obs_stack_batch)[torch.arange(self.batch_size), action_batch]
         with torch.no_grad():
             q_next: torch.Tensor = self.q_target_network(next_obs_stack_batch)
-            target_batch = reward_batch + self.discount_factor * q_next.max(dim=-1).values * (1 - terminated_batch)
-        loss = torch.mean((target_batch - q) ** 2)
+            if not self.use_double:
+                target_batch = reward_batch + self.discount_factor * q_next.max(dim=-1).values * (1 - terminated_batch)
+            elif self.use_double:
+                argmax_action_batch: torch.Tensor = self.q_network(next_obs_stack_batch).argmax(dim=-1)
+                target_batch = reward_batch + self.discount_factor * q_next[torch.arange(self.batch_size), argmax_action_batch] * (1 - terminated_batch)
+        loss = torch.sum((target_batch - q) ** 2)
         self.optim.zero_grad()
         loss.backward()
         self.optim.step()
+        return loss.item(), q.mean().item()
 
 
     def update_target_network(
@@ -267,7 +297,7 @@ class DQNAgent():
         terminated: bool,
         truncated: bool,
         next_obs: np.ndarray
-    ) -> None:
+    ) -> Tuple[float, float] | Tuple[None, None]:
         self.replay_buffer.append(
             self.preprocess_obs(obs),
             action,
@@ -276,12 +306,15 @@ class DQNAgent():
             terminated
         )
 
+        q_network_loss = None
+        q_mean = None
         if self.replay_buffer.full >= self.replay_start_size:
-            self.update_network()
+            q_network_loss, q_mean = self.update_network()
         if self.trained_frames % self.target_network_update_frequency == 0:
             self.update_target_network()
         self.trained_frames += 1
         self.decay_epsilon()
+        return q_network_loss, q_mean
 
 
 def train(
@@ -292,9 +325,14 @@ def train(
 ):
     if use_wandb:
         wandb.login()
-        run_name = env_name.replace('/', '-')
+        project_name = env_name.replace('/', '-')
+        run_name = 'run'
+        if agent.use_double:
+            run_name += 'Double'
+        if agent.use_dueling:
+            run_name += 'Dueling'
         run = wandb.init(
-            project=f'rl_implementation_{run_name}',
+            project=f'{project_name}',
             name=run_name
         )
 
@@ -305,6 +343,8 @@ def train(
         done = False
         step = 0
         reward_sum = 0.0
+        all_q_network_loss = []
+        all_q_mean = []
         while not done:
             if step <= 4:
                 action = 0 # noop
@@ -312,11 +352,30 @@ def train(
                 stacked_frames = agent.replay_buffer.stack_recent_frames()
                 action = agent.get_action(stacked_frames)
             next_obs, reward, terminated, truncated, info = agent.env.step(action)
-            agent.update_after_step(obs, action, reward, terminated, truncated, next_obs)
+            if agent.epsilon_backup is None:
+                if reward == 1.0 or reward == -1.0:
+                    step = 0
+                    q_network_loss, q_mean= agent.update_after_step(obs, action, reward, True, truncated, next_obs)
+                else:
+                    q_network_loss, q_mean= agent.update_after_step(obs, action, reward, terminated, truncated, next_obs)
             done = terminated or truncated
             obs = next_obs
             reward_sum += reward
             step += 1
+
+            if q_network_loss:
+                all_q_network_loss.append(q_network_loss)
+                all_q_mean.append(q_mean)
+
+        if all_q_network_loss and use_wandb:
+            wandb.log(
+                {
+                    'q_network_loss': sum(all_q_network_loss) / len(all_q_network_loss),
+                    'q_mean': sum(all_q_mean) / len(all_q_mean)
+                },
+                step=agent.trained_frames
+            )
+
 
         return terminated, truncated, reward_sum
         
@@ -349,12 +408,12 @@ if __name__ == '__main__':
     batch_size: int = 32
     replay_memory_size = 1000000
     target_network_update_frequency: int = 10000
-    use_dueling: bool = False
-    use_double: bool = False
+    use_dueling: bool = True
+    use_double: bool = True
     discount_factor: float = 0.99
     lr: float = 3e-4
-    # replay_start_size: int = 50000
-    replay_start_size: int = 500
+    replay_start_size: int = 50000
+    # replay_start_size: int = 5000
 
     use_wandb: bool = True
     device: Literal['cpu', 'cuda'] = 'cuda'
