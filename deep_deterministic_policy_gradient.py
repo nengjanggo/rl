@@ -129,7 +129,8 @@ class DDPGAgent():
         final_noise_scale: float,
         noise_scale_decay_steps: int,
         random_action_steps: int,
-        replay_start_size: int,
+        actor_replay_start_size: int,
+        critic_replay_start_size: int,
         device: Literal['cpu', 'cuda'],
         use_wandb: bool
     ):
@@ -147,7 +148,8 @@ class DDPGAgent():
         self.final_noise_scale: float = final_noise_scale
         self.noise_scale_decay_steps: int = noise_scale_decay_steps
         self.random_action_steps: int = random_action_steps
-        self.replay_start_size: int = replay_start_size
+        self.actor_replay_start_size: int = actor_replay_start_size
+        self.critic_replay_start_size: int = critic_replay_start_size
         self.device: Literal['cpu', 'cuda'] = device
         self.use_wandb: bool = use_wandb
         self.mode: Literal['train', 'eval'] = 'train'
@@ -244,25 +246,30 @@ class DDPGAgent():
 
     def update_network(
         self
-    ) -> Tuple[float, float]:
+    ) -> Tuple[float | None, float | None]:
         obs_batch, action_batch, reward_batch, next_obs_batch, terminated_batch = self.replay_buffer.sample_minibatch()
         q: torch.Tensor = self.q_network(obs_batch, action_batch)
         with torch.no_grad():
             q_next: torch.Tensor = self.q_target_network(next_obs_batch, self.policy_target_network(next_obs_batch))
             target_batch = reward_batch + self.discount_factor * q_next * (1 - terminated_batch)
 
-        critic_loss = torch.mean((target_batch - q) ** 2)
-        self.critic_optim.zero_grad()
-        critic_loss.backward()
-        self.critic_optim.step()
+        critic_loss = None
+        actor_loss = None
 
-        actor_loss = -self.q_network(obs_batch, self.policy_network(obs_batch)).mean()
-        self.actor_optim.zero_grad()
-        actor_loss.backward()
-        self.actor_optim.step()
-        self.critic_optim.zero_grad()
+        if self.replay_buffer.full >= self.critic_replay_start_size:
+            critic_loss = torch.mean((target_batch - q) ** 2)
+            self.critic_optim.zero_grad()
+            critic_loss.backward()
+            self.critic_optim.step()
 
-        return actor_loss.item(), critic_loss.item()
+        if self.replay_buffer.full >= self.actor_replay_start_size:
+            actor_loss = -self.q_network(obs_batch, self.policy_network(obs_batch)).mean()
+            self.actor_optim.zero_grad()
+            actor_loss.backward()
+            self.actor_optim.step()
+            self.critic_optim.zero_grad()
+
+        return actor_loss.item() if actor_loss else actor_loss, critic_loss.item() if critic_loss else critic_loss
 
 
     def sync_target_network(
@@ -302,7 +309,7 @@ class DDPGAgent():
         terminated: bool,
         truncated: bool,
         next_obs: np.ndarray
-    ) -> Tuple[float, float] | Tuple[None, None]:
+    ) -> Tuple[float | None, float | None]:
         self.replay_buffer.append(
             torch.tensor(obs),
             torch.tensor(action),
@@ -314,7 +321,7 @@ class DDPGAgent():
 
         actor_loss = None
         critic_loss = None
-        if self.replay_buffer.full >= self.replay_start_size:
+        if self.replay_buffer.full >= min(self.actor_replay_start_size, self.critic_replay_start_size):
             actor_loss, critic_loss = self.update_network()
             self.update_target_network()
         self.trained_steps += 1
@@ -360,17 +367,14 @@ def train(
 
             if actor_loss is not None:
                 all_actor_loss.append(actor_loss)
+            if critic_loss is not None:
                 all_critic_loss.append(critic_loss)
 
-        if all_actor_loss and use_wandb:
-            wandb.log(
-                {
-                    'actor_loss': sum(all_actor_loss) / len(all_actor_loss),
-                    'critic_loss': sum(all_critic_loss) / len(all_critic_loss)
-                },
-                step=agent.trained_steps
-            )
-
+        if use_wandb:
+            if all_actor_loss:
+                wandb.log({'actor_loss': sum(all_actor_loss) / len(all_actor_loss)}, step=agent.trained_steps)
+            if all_critic_loss:
+                wandb.log({'critic_loss': sum(all_critic_loss) / len(all_critic_loss)}, step=agent.trained_steps)
 
         return terminated, truncated, reward_sum
         
@@ -395,19 +399,18 @@ def train(
 
 if __name__ == '__main__':
     batch_size: int = 64
-    total_train_steps: int = 10000000
-    # total_train_steps: int = 1000000
+    total_train_steps: int = 2500000
     replay_memory_size = 1000000
-    # replay_memory_size = 100000
     tau: float = 0.001
     discount_factor: float = 0.99
     actor_lr: float = 1e-4
     critic_lr: float = 1e-3
-    initial_noise_scale: float = 0.1
-    final_noise_scale: float = 0.05
-    noise_scale_decay_steps: int = int(0.1 * total_train_steps)
-    random_action_steps: int = 10000
-    replay_start_size: int = 10000
+    initial_noise_scale: float = 0.2
+    final_noise_scale: float = 0.0
+    noise_scale_decay_steps: int = int(0.5 * total_train_steps)
+    random_action_steps: int = 50000
+    actor_replay_start_size: int = 500000
+    critic_replay_start_size: int = 100000
     device: Literal['cpu', 'cuda'] = 'cuda'
     use_wandb: bool = True
 
@@ -416,7 +419,7 @@ if __name__ == '__main__':
         'HalfCheetah-v5',
         'InvertedPendulum-v5',
         'Walker2d-v5'
-    ] = 'Ant-v5'
+    ] = 'InvertedPendulum-v5'
 
     train_env = get_env(
         env_name=env_name,
@@ -435,7 +438,8 @@ if __name__ == '__main__':
         final_noise_scale,
         noise_scale_decay_steps,
         random_action_steps,
-        replay_start_size,
+        actor_replay_start_size,
+        critic_replay_start_size,
         device,
         use_wandb
     )
